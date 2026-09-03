@@ -1,0 +1,74 @@
+<div class="shell" [class.expanded]="expanded()">
+  @if (expanded()) {
+    <section class="panel">
+      <header class="panel-head">
+        <div class="brand">
+          <span class="dot"></span>
+          <h1>MiniMe</h1>
+        </div>
+        <nav class="tabs">
+          <button [class.active]="tab() === 'chat'" (click)="tab.set('chat')">Chat</button>
+          <button [class.active]="tab() === 'memory'" (click)="tab.set('memory')">
+            What I know about you
+          </button>
+          <button [class.active]="tab() === 'skills'" (click)="tab.set('skills')">
+            Skills &amp; Reminders
+          </button>
+        </nav>
+      </header>
+
+      @if (error()) {
+        <p class="banner">{{ error() }}</p>
+      }
+
+      @switch (tab()) {
+        @case ('chat') {
+          <div class="stream" #scroller>
+            @if (messages().length === 0) {
+              <p class="empty">
+                One long conversation, stored only on this machine. Say something to begin.
+              </p>
+            }
+            @for (message of messages(); track message.id) {
+              <article class="msg" [class.user]="message.role === 'user'">
+                <p>{{ message.content }}</p>
+                <time>{{ message.createdAt | date: 'shortTime' }}</time>
+              </article>
+            }
+          </div>
+
+          <form class="composer" (submit)="send(); $event.preventDefault()">
+            <button
+              type="button"
+              class="mic"
+              [class.on]="listening"
+              [disabled]="!voiceSupported"
+              [title]="voiceSupported ? 'Talk to MiniMe' : 'Voice input unavailable'"
+              (click)="micClick()"
+            >
+              &#127908;
+            </button>
+            <input
+              [ngModel]="draft()"
+              (ngModelChange)="draft.set($event)"
+              name="draft"
+              autocomplete="off"
+              placeholder="Talk to MiniMe…"
+            />
+            <button type="submit" class="send">Send</button>
+          </form>
+        }
+
+        @case ('memory') {
+          <mm-memory-tab />
+        }
+
+        @case ('skills') {
+          <mm-skills-tab />
+        }
+      }
+    </section>
+  }
+
+  <mm-orb [state]="orbState()" (toggle)="toggle()" />
+</div>

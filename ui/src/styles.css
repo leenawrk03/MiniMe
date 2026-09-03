@@ -1,0 +1,28 @@
+:root {
+  /* MiniMe design tokens */
+  --mm-bg: #0d0f14;
+  --mm-panel: rgba(18, 21, 28, 0.92);
+  --mm-border: rgba(255, 255, 255, 0.09);
+  --mm-text: #eef1f6;
+  --mm-muted: #8b93a5;
+  --mm-accent: #6ee7ff;
+  --mm-accent-2: #a68bff;
+  --mm-user: #1b2231;
+  --mm-radius: 18px;
+  --mm-font: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  /* Electron window is transparent: the orb floats over the desktop. */
+  background: transparent;
+  color: var(--mm-text);
+  font-family: var(--mm-font);
+  overflow: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}

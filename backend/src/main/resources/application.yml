@@ -1,0 +1,57 @@
+server:
+  port: 842
+
+spring:
+  application:
+    name: minime-backend
+  datasource:
+    url: jdbc:postgresql://localhost:5433/minime
+    username: minime
+    password: minime
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+minime:
+  # Set GEMINI_API_KEY in your environment. Without it MiniMe runs in echo mode.
+  gemini:
+    api-key: ${GEMINI_API_KEY:}
+    # Use alias names ("-latest") - Google retires dated model ids.
+    # Flash-lite first: it is the fastest and the least congested.
+    model: ${GEMINI_MODEL:gemini-flash-lite-latest}
+    # Tried in order on 503 (overloaded), 429 (quota) or 404 (model retired).
+    fallback-models:
+      - gemini-flash-latest
+      - gemini-2.0-flash
+    temperature: 0.8
+    # Fail over fast instead of sleeping through a busy model.
+    max-retries: 1
+    retry-backoff-ms: 400
+    timeout-seconds: 20
+    max-output-tokens: 512
+  # Phase 2: persistent memory (pgvector).
+  memory:
+    embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}
+    recall-limit: 4
+    # Extra LLM call per turn to mine facts. Off by default: it doubled the
+    # per-turn latency and burned the free-tier quota.
+    llm-extraction: false
+    min-similarity: 0.55
+    duplicate-similarity: 0.93
+  # One single long conversation, all data local.
+  conversation-id: primary
+  system-prompt: |
+    You are MiniMe, a warm, concise personal companion living as a glowing orb on
+    the user's desktop. You speak naturally, like a close friend who remembers.
+    Keep replies short and conversational unless asked for detail.
+    You have a persistent memory of the user and a set of custom skills and
+    reminders; both are supplied to you each turn when relevant.
+
+logging:
+  level:
+    dev.minime: INFO

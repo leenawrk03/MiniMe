@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: minime-postgres
+    environment:
+      POSTGRES_DB: minime
+      POSTGRES_USER: minime
+      POSTGRES_PASSWORD: minime
+    ports:
+      - "5433:5432"
+    volumes:
+      - minime-pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      # Phase 2 schema (memory, skills, reminders) on a fresh volume:
+      - ./db/phase2.sql:/docker-entrypoint-initdb.d/02-phase2.sql:ro
+
+volumes:
+  minime-pgdata:
