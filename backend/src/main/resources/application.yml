@@ -4,6 +4,11 @@ server:
 spring:
   application:
     name: minime-backend
+
+  servlet:
+    multipart:
+      max-file-size: 15MB
+      max-request-size: 15MB
   datasource:
     url: jdbc:postgresql://localhost:5433/minime
     username: minime
@@ -23,7 +28,7 @@ minime:
     api-key: ${GEMINI_API_KEY:}
     # Use alias names ("-latest") - Google retires dated model ids.
     # Flash-lite first: it is the fastest and the least congested.
-    model: ${GEMINI_MODEL:gemini-flash-lite-latest}
+    model: ${GEMINI_MODEL:gemini-3.1-flash-lite}
     # Tried in order on 503 (overloaded), 429 (quota) or 404 (model retired).
     fallback-models:
       - gemini-flash-latest

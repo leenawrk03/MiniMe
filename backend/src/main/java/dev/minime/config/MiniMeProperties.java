@@ -17,14 +17,14 @@ public class MiniMeProperties {
     public static class Gemini {
         private String apiKey = "";
         /** Alias models never get retired, so they are the safe default. */
-        private String model = "gemini-flash-lite-latest";
+        private String model = "gemini-3.1-flash-lite";
         /**
          * Tried in order when the primary model answers 503 UNAVAILABLE
          * (overloaded) or 404 NOT_FOUND (model retired).
          */
         private List<String> fallbackModels = new ArrayList<>(Arrays.asList(
-                "gemini-flash-latest",
-                "gemini-2.0-flash"
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash-lite"
         ));
         private double temperature = 0.8;
         /** Attempts per model before moving on to the next one. */
