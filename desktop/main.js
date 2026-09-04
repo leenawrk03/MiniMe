@@ -3,6 +3,7 @@ const {
   BrowserWindow,
   ipcMain,
   screen,
+  systemPreferences,
   session,
 } = require('electron');
 
@@ -28,19 +29,7 @@ function getBottomRightPosition(width, height) {
     y: workArea.y + workArea.height - height - 24,
   };
 }
-app.whenReady().then(() => {
-  session.defaultSession.setPermissionRequestHandler(
-    (webContents, permission, callback) => {
-      if (permission === 'media') {
-        callback(true);
-      } else {
-        callback(true);
-      }
-    }
-  );
 
-  createWindow();
-});
 function createWindow() {
   const position = getBottomRightPosition(
     COLLAPSED.width,
@@ -62,46 +51,26 @@ function createWindow() {
 
     alwaysOnTop: true,
     type: 'panel',
-
     hasShadow: false,
 
     show: false,
 
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
 
-  /*
-   * Load Angular.
-   *
-   * Angular still runs on localhost,
-   * but the user sees only the Electron window.
-   */
   win.loadURL('http://localhost:4200/');
+  win.webContents.openDevTools();
 
-  /*
-   * Show only after Angular has loaded.
-   */
   win.once('ready-to-show', () => {
     win.show();
   });
 
-  /*
-   * Keep MiniMe above normal windows.
-   */
   win.setAlwaysOnTop(true, 'floating');
-  win.setVisibleOnAllWorkspaces(true, {
-    visibleOnFullScreen: true,
-  });
 
-  /*
-   * Optional: don't show the app in the taskbar/dock
-   * as a normal browser-style window.
-   */
   win.setSkipTaskbar(false);
 
   win.on('closed', () => {
@@ -127,15 +96,11 @@ ipcMain.on('minime:resize', (_event, expanded) => {
   win.setBounds({
     x: position.x,
     y: position.y,
-
     width: size.width,
     height: size.height,
   });
 
   win.setAlwaysOnTop(true, 'floating');
-  win.setVisibleOnAllWorkspaces(true, {
-    visibleOnFullScreen: true,
-  });
 });
 
 
@@ -143,14 +108,64 @@ ipcMain.on('minime:resize', (_event, expanded) => {
    ELECTRON START
    ===================================================== */
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+
+  /*
+   * macOS microphone permission
+   */
+  if (process.platform === 'darwin') {
+    const status =
+      systemPreferences.getMediaAccessStatus('microphone');
+
+    console.log('🎤 MIC STATUS:', status);
+
+    if (status !== 'granted') {
+      const granted =
+        await systemPreferences.askForMediaAccess('microphone');
+
+      console.log('🎤 MIC REQUEST RESULT:', granted);
+    }
+  }
+
+
+
+  /*
+   * Chromium media permission
+   */
+  session.defaultSession.setPermissionRequestHandler(
+    (_webContents, permission, callback) => {
+      if (permission === 'media') {
+        callback(true);
+        return;
+      }
+
+      callback(false);
+    }
+  );
+
+
+  /*
+   * Chromium permission check
+   */
+  session.defaultSession.setPermissionCheckHandler(
+    (_webContents, permission) => {
+      return permission === 'media';
+    }
+  );
+
+
+  /*
+   * Start Orb
+   */
   createWindow();
+
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     }
   });
+
 });
 
 
@@ -158,10 +173,7 @@ app.whenReady().then(() => {
    QUIT
    ===================================================== */
 
-app.on('window-all-closed', (event) => {
-  /*
-   * Don't quit automatically on macOS.
-   */
+app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
