@@ -16,6 +16,7 @@ import { VoiceService } from './voice/voice.service';
 import { MemoryTabComponent } from './memory/memory-tab.component';
 import { SkillsTabComponent } from './memory/skills-tab.component';
 import { ReminderSocketService } from './memory/reminder-socket.service';
+import { AgentService } from './agent.service';
 
 type Tab = 'chat' | 'memory' | 'skills';
 
@@ -43,6 +44,18 @@ export class AppComponent implements OnInit, AfterViewChecked {
   readonly messages;
   readonly error;
 
+  /*
+   * Computer-control confirmation.
+   *
+   * Example:
+   *
+   * User: "Hey Toto, open Chrome"
+   * MiniMe: "I can open Google Chrome. Should I?"
+   * User: "Yes"
+   */
+  private pendingAppAction: string | null = null;
+  private waitingForActionConfirmation = false;
+
   readonly orbState = computed(() => {
     if (this.voice.armed()) {
       return 'listening';
@@ -59,15 +72,11 @@ export class AppComponent implements OnInit, AfterViewChecked {
     private chat: ChatService,
     private voice: VoiceService,
     private reminders: ReminderSocketService,
+    private agent: AgentService,
   ) {
     this.messages = this.chat.messages;
     this.error = this.chat.error;
 
-    /*
-     * VoiceService calls this whenever it hears:
-     *
-     * "Hey Toto ..."
-     */
     this.voice.onCommand = async (text: string) => {
       await this.handleVoiceCommand(text);
     };
@@ -86,10 +95,6 @@ export class AppComponent implements OnInit, AfterViewChecked {
 
     /*
      * Start wake-word listening automatically.
-     *
-     * MiniMe will now listen for:
-     *
-     * "Hey Toto"
      */
     if (this.voiceSupported) {
       setTimeout(() => {
@@ -98,7 +103,7 @@ export class AppComponent implements OnInit, AfterViewChecked {
     }
 
     /*
-     * Phase 2 reminders.
+     * Reminders.
      */
     this.reminders.connect((text) => {
       this.chat.orbState.set('speaking');
@@ -122,21 +127,17 @@ export class AppComponent implements OnInit, AfterViewChecked {
     this.setExpanded(!this.expanded());
   }
 
-  /**
-   * Keeps the frameless Electron window sized to the
-   * current layout.
-   */
   private setExpanded(value: boolean): void {
-    this.expanded.set(value);
+  this.expanded.set(value);
 
-    (
-      window as unknown as {
-        minime?: {
-          resize(v: boolean): void;
-        };
-      }
-    ).minime?.resize(value);
-  }
+  (
+    window as unknown as {
+      electronAPI?: {
+        resize(v: boolean): void;
+      };
+    }
+  ).electronAPI?.resize(value);
+}
 
   /**
    * Normal typed chat.
@@ -155,10 +156,7 @@ export class AppComponent implements OnInit, AfterViewChecked {
   }
 
   /**
-   * Orb/microphone button.
-   *
-   * Manual click skips the wake word and immediately
-   * starts listening for a command.
+   * Manual microphone button.
    */
   micClick(): void {
     if (!this.voiceSupported) {
@@ -186,31 +184,276 @@ export class AppComponent implements OnInit, AfterViewChecked {
 
     console.log('MiniMe voice command:', command);
 
-    /*
-     * Open the panel so the user can see the conversation.
-     */
     this.setExpanded(true);
 
-    /*
-     * Send the spoken command through the exact same
-     * ChatService used by typed chat.
-     */
     try {
+      /*
+       * ==========================================================
+       * PENDING COMPUTER ACTION
+       * ==========================================================
+       */
+
+      if (this.pendingAppAction) {
+  const appName = this.pendingAppAction;
+
+  const lower = command.toLowerCase().trim();
+
+  const confirmed =
+    lower === 'yes' ||
+    lower === 'yeah' ||
+    lower === 'yep' ||
+    lower === 'sure' ||
+    lower === 'yes do it' ||
+    lower === 'go ahead' ||
+    lower === 'open it';
+
+  const rejected =
+    lower === 'no' ||
+    lower === 'nope' ||
+    lower === 'cancel' ||
+    lower === "don't" ||
+    lower === 'do not';
+
+  if (confirmed) {
+    this.pendingAppAction = null;
+    this.waitingForActionConfirmation = false;
+
+    try {
+      await this.agent.openApp(appName);
+
+      this.chat.orbState.set('speaking');
+
+      this.voice.speak(
+        'Done.',
+        () => {},
+      );
+    } catch (error) {
+      console.error(
+        '❌ Could not open app:',
+        error,
+      );
+
+      this.chat.orbState.set('speaking');
+
+      this.voice.speak(
+        `Sorry, I couldn't open ${appName}.`,
+      );
+    }
+
+    return;
+  }
+
+  if (rejected) {
+    this.pendingAppAction = null;
+    this.waitingForActionConfirmation = false;
+
+    this.chat.orbState.set('speaking');
+
+    this.voice.speak('Okay.');
+
+    return;
+  }
+
+  /*
+   * IMPORTANT:
+   * Don't destroy the pending action if the answer
+   * wasn't understood.
+   */
+  this.waitingForActionConfirmation = true;
+
+  this.chat.orbState.set('speaking');
+
+  this.voice.speak(
+    'Please say yes or no.',
+    () => {
+      this.voice.listenForConfirmation();
+    },
+  );
+
+  return;
+}
+
+      /*
+       * ==========================================================
+       * SCREEN / VISION COMMANDS
+       * ==========================================================
+       */
+
+      const lower = command.toLowerCase();
+
+      const screenCommand =
+        lower.includes('what am i looking at') ||
+        lower.includes('what is on my screen') ||
+        lower.includes("what's on my screen") ||
+        lower.includes('read my screen') ||
+        lower.includes('look at my screen') ||
+        lower.includes('see my screen') ||
+        lower.includes('what do you see') ||
+        lower.includes('can you see my screen');
+
+      if (screenCommand) {
+        console.log('👀 Screen agent activated');
+
+        this.chat.orbState.set('thinking');
+
+        this.voice.status.set(
+          'Looking at your screen…',
+        );
+
+        const answer =
+          await this.agent.readScreen(command);
+
+        console.log(
+          '👀 Gemini screen response:',
+          answer,
+        );
+
+        if (!answer) {
+          throw new Error(
+            'Gemini returned an empty screen description',
+          );
+        }
+
+        this.chat.orbState.set('speaking');
+
+        this.voice.speak(
+          answer,
+          () => this.chat.orbState.set('idle'),
+        );
+
+        return;
+      }
+
+      /*
+       * ==========================================================
+       * OPEN APPLICATION
+       * ==========================================================
+       */
+
+      const appName = this.detectAppToOpen(lower);
+
+if (appName) {
+  console.log(
+    '🖥️ Computer action detected:',
+    'OPEN_APP',
+    appName,
+  );
+
+  this.pendingAppAction = appName;
+  this.waitingForActionConfirmation = true;
+
+  this.chat.orbState.set('speaking');
+
+  this.voice.speak(
+    `I can open ${appName}. Should I?`,
+    () => {
+      this.voice.listenForConfirmation();
+    },
+  );
+
+  return;
+}
+
+      /*
+       * ==========================================================
+       * NORMAL CHAT
+       * ==========================================================
+       */
+
       await this.chat.send(command);
 
-      /*
-       * Speak the assistant's latest response.
-       */
       this.speakLast();
-    } catch (error) {
-      console.error('Voice command failed:', error);
 
-      /*
-       * Return to wake-word listening even if the backend
-       * fails.
-       */
+    } catch (error) {
+      console.error(
+        'Voice command failed:',
+        error,
+      );
+
+      this.pendingAppAction = null;
+
       this.chat.orbState.set('idle');
+
+      this.voice.speak(
+        'Sorry, I had trouble doing that.',
+        () => this.chat.orbState.set('idle'),
+      );
     }
+  }
+
+  /**
+   * Converts natural voice phrases into one of the exact
+   * application names allowed by Electron.
+   *
+   * Examples:
+   *
+   * "open Chrome"
+   * "launch Google Chrome"
+   * "start Safari"
+   */
+  private detectAppToOpen(command: string): string | null {
+    const openIntent =
+      command.includes('open ') ||
+      command.includes('launch ') ||
+      command.includes('start ') ||
+      command.includes('run ');
+
+    if (!openIntent) {
+      return null;
+    }
+
+    if (
+      command.includes('chrome') ||
+      command.includes('google chrome')
+    ) {
+      return 'Google Chrome';
+    }
+
+    if (command.includes('safari')) {
+      return 'Safari';
+    }
+
+    if (
+      command.includes('visual studio code') ||
+      command.includes('vs code') ||
+      command.includes('vscode')
+    ) {
+      return 'Visual Studio Code';
+    }
+
+    if (command.includes('terminal')) {
+      return 'Terminal';
+    }
+
+    if (command.includes('finder')) {
+      return 'Finder';
+    }
+
+    if (command.includes('notes')) {
+      return 'Notes';
+    }
+
+    if (command.includes('calendar')) {
+      return 'Calendar';
+    }
+
+    if (command.includes('mail')) {
+      return 'Mail';
+    }
+
+    if (command.includes('messages')) {
+      return 'Messages';
+    }
+
+    if (command.includes('slack')) {
+      return 'Slack';
+    }
+
+    if (command.includes('whatsapp')) {
+      return 'WhatsApp';
+    }
+
+    return null;
   }
 
   /**

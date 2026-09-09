@@ -1,636 +1,874 @@
-import { Injectable, NgZone, signal, inject } from '@angular/core';
-import { matchWakeWord } from './wake-word';
+import { Injectable, NgZone, signal } from '@angular/core';
 
-@Injectable({ providedIn: 'root' })
+@Injectable({
+  providedIn: 'root',
+})
 export class VoiceService {
-  private zone = inject(NgZone);
-
-  // ============================================================
-  // CONFIG
-  // ============================================================
-
-  /**
-   * Spring Boot backend.
-   *
-   * Change this if your backend runs on another port/host.
-   */
   private readonly API_BASE = 'http://localhost:842';
 
-  private readonly TRANSCRIBE_URL =
-    `${this.API_BASE}/api/voice/transcribe`;
+  readonly supported = !!navigator.mediaDevices?.getUserMedia;
 
-  /**
-   * How long we wait after speech stops before sending
-   * the recording to Spring Boot.
-   */
-  private readonly SILENCE_MS = 1200;
+  readonly listening = signal(false);
+  readonly armed = signal(false);
+  readonly transcript = signal('');
+  readonly status = signal('Listening for “hey toto”');
 
-  /**
-   * Ignore very short microphone noise.
-   */
-  private readonly MIN_RECORDING_MS = 300;
+  private mediaStream?: MediaStream;
+  private mediaRecorder?: MediaRecorder;
+  private audioContext?: AudioContext;
+  private analyser?: AnalyserNode;
+  private vadFrame?: number;
+  private silenceTimer?: ReturnType<typeof setTimeout>;
 
-  /**
-   * RMS threshold used by the simple microphone VAD.
-   *
-   * If your Mac microphone is very quiet/noisy, this can be
-   * adjusted later.
-   */
-  private readonly SPEECH_THRESHOLD = 0.015;
-
-  /**
-   * How often the VAD checks microphone volume.
-   */
-  private readonly VAD_INTERVAL_MS = 50;
-
-  // ============================================================
-  // MEDIA
-  // ============================================================
-
-  private mediaStream: MediaStream | null = null;
-  private mediaRecorder: MediaRecorder | null = null;
-
-  private audioContext: AudioContext | null = null;
-  private analyser: AnalyserNode | null = null;
-  private vadTimer: any = null;
-
-  private audioChunks: Blob[] = [];
-
-  private recordingStartedAt = 0;
-  private lastSpeechAt = 0;
-
-  private processing = false;
-
-  // ============================================================
-  // STATE
-  // ============================================================
+  private chunks: Blob[] = [];
 
   private wantRunning = false;
 
-  /**
-   * true when we are waiting for "hey toto".
-   *
-   * false while waiting for the actual command.
-   */
   private wakeBuffer = '';
 
-  supported =
-    typeof window !== 'undefined' &&
-    !!(
-      navigator.mediaDevices &&
-      typeof navigator.mediaDevices.getUserMedia === 'function'
-    );
+  private readonly wakeWords = [
+    'hey toto',
+    'hey toto,',
+    'hey total',
+    'hey toto.',
+    'hi toto',
+  ];
 
-  listening = signal(false);
-  armed = signal(false);
-  transcript = signal('');
-  status = signal('Idle');
+  /**
+   * True when MiniMe is waiting for a direct confirmation.
+   *
+   * Example:
+   *
+   * MiniMe: "I can open Google Chrome. Should I?"
+   * User:   "yes"
+   *
+   * In confirmation mode, "yes" is submitted directly.
+   */
+  private confirmationMode = false;
 
-  onCommand: (text: string) => void = () => {};
+  /**
+   * Called by AppComponent whenever a voice command is ready.
+   */
+  onCommand?: (text: string) => void | Promise<void>;
 
-  // ============================================================
-  // START
-  // ============================================================
+  constructor(private zone: NgZone) {}
 
+  /**
+   * Start continuous microphone monitoring.
+   */
   async start(): Promise<void> {
-    if (!this.supported) {
-      this.zone.run(() => {
-        this.status.set('Microphone not supported');
-      });
-      return;
-    }
-
-    if (this.wantRunning) {
+    if (!this.supported || this.wantRunning) {
       return;
     }
 
     this.wantRunning = true;
+    this.confirmationMode = false;
 
     try {
-      await this.openMicrophone();
+      await this.ensureMicrophone();
 
       this.zone.run(() => {
         this.listening.set(true);
+        this.armed.set(false);
+        this.transcript.set('');
         this.status.set('Listening for “hey toto”');
       });
 
       this.startVAD();
-    } catch (error: any) {
-      console.error('❌ Failed to start microphone:', error);
+
+      console.log('🎤 Voice listening started');
+    } catch (error) {
+      console.error('❌ Could not start voice:', error);
 
       this.wantRunning = false;
 
       this.zone.run(() => {
         this.listening.set(false);
+        this.armed.set(false);
+        this.status.set('Microphone unavailable');
+      });
+    }
+  }
 
-        if (
-          error?.name === 'NotAllowedError' ||
-          error?.name === 'PermissionDeniedError'
-        ) {
-          this.status.set('Microphone permission blocked');
-        } else {
-          this.status.set(
-            `Microphone error: ${error?.message || error?.name || 'Unknown error'}`
+  /**
+   * Stop continuous microphone monitoring.
+   */
+  stop(): void {
+    this.wantRunning = false;
+    this.confirmationMode = false;
+    this.wakeBuffer = '';
+
+    this.stopRecording();
+    this.stopVAD();
+
+    if (this.mediaStream) {
+      for (const track of this.mediaStream.getTracks()) {
+        track.stop();
+      }
+
+      this.mediaStream = undefined;
+    }
+
+    this.zone.run(() => {
+      this.listening.set(false);
+      this.armed.set(false);
+      this.transcript.set('');
+      this.status.set('Voice off');
+    });
+
+    console.log('🎤 Voice listening stopped');
+  }
+
+  /**
+   * Manually enter command mode from the microphone button.
+   */
+  arm(): void {
+    /*
+     * IMPORTANT:
+     *
+     * Do not require wantRunning here.
+     *
+     * If the microphone stream already exists, simply arm it.
+     */
+    if (!this.mediaStream) {
+      console.warn(
+        '🎤 Cannot arm manually because microphone is not available.',
+      );
+      return;
+    }
+
+    this.confirmationMode = false;
+    this.wakeBuffer = '';
+
+    this.zone.run(() => {
+      this.armed.set(true);
+      this.transcript.set('');
+      this.status.set('Listening…');
+    });
+
+    console.log('🎤 Manual voice mode armed');
+  }
+
+  /**
+   * Enter direct confirmation mode.
+   *
+   * This is called by AppComponent after MiniMe asks:
+   *
+   * "I can open Google Chrome. Should I?"
+   *
+   * The next transcript is accepted directly.
+   *
+   * It does NOT require:
+   * "Hey Toto"
+   */
+  listenForConfirmation(): void {
+    /*
+     * IMPORTANT FIX:
+     *
+     * Previously this method returned when wantRunning was false.
+     *
+     * That could leave confirmationMode disabled, meaning
+     * "yes" would be treated as normal speech instead of
+     * being sent to AppComponent.
+     *
+     * If the microphone stream is already available, we can
+     * safely enable confirmation mode.
+     */
+    if (!this.mediaStream) {
+      console.warn(
+        '🎤 Confirmation requested but microphone is unavailable.',
+      );
+
+      return;
+    }
+
+    this.confirmationMode = true;
+    this.wakeBuffer = '';
+
+    this.zone.run(() => {
+      this.armed.set(true);
+      this.transcript.set('');
+      this.status.set('Listening for confirmation…');
+    });
+
+    console.log('🎤 Confirmation mode armed');
+  }
+
+  /**
+   * Speak text using browser speech synthesis.
+   */
+  speak(text: string, onDone?: () => void): void {
+    if (!text?.trim()) {
+      onDone?.();
+      return;
+    }
+
+    try {
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+
+      utterance.onstart = () => {
+        this.zone.run(() => {
+          this.status.set('Speaking…');
+        });
+      };
+
+      utterance.onend = () => {
+        /*
+         * Run callback FIRST.
+         *
+         * AppComponent may call:
+         *
+         * listenForConfirmation()
+         *
+         * which sets confirmationMode = true.
+         */
+        try {
+          onDone?.();
+        } catch (error) {
+          console.error(
+            '❌ Voice callback failed:',
+            error,
           );
+        }
+
+        this.zone.run(() => {
+          if (this.confirmationMode) {
+            this.status.set('Listening for confirmation…');
+          } else if (this.armed()) {
+            this.status.set('Listening…');
+          } else {
+            this.status.set('Listening for “hey toto”');
+          }
+        });
+      };
+
+      utterance.onerror = (event) => {
+        console.error(
+          '❌ Speech synthesis error:',
+          event,
+        );
+
+        try {
+          onDone?.();
+        } catch (error) {
+          console.error(
+            '❌ Voice callback failed:',
+            error,
+          );
+        }
+
+        this.zone.run(() => {
+          if (this.confirmationMode) {
+            this.status.set('Listening for confirmation…');
+          } else if (this.armed()) {
+            this.status.set('Listening…');
+          } else {
+            this.status.set('Listening for “hey toto”');
+          }
+        });
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (error) {
+      console.error(
+        '❌ Speech synthesis failed:',
+        error,
+      );
+
+      try {
+        onDone?.();
+      } catch (callbackError) {
+        console.error(
+          '❌ Voice callback failed:',
+          callbackError,
+        );
+      }
+
+      this.zone.run(() => {
+        if (this.confirmationMode) {
+          this.status.set('Listening for confirmation…');
+        } else if (this.armed()) {
+          this.status.set('Listening…');
+        } else {
+          this.status.set('Listening for “hey toto”');
         }
       });
     }
   }
 
-  // ============================================================
-  // MICROPHONE
-  // ============================================================
+  /**
+   * Make sure microphone stream exists.
+   */
+  private async ensureMicrophone(): Promise<void> {
+    if (this.mediaStream) {
+      return;
+    }
 
-  private async openMicrophone(): Promise<void> {
-  if (this.mediaStream) {
-    return;
+    this.mediaStream =
+      await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+    console.log('🎤 Microphone access granted');
   }
 
-  console.log('🎤 Requesting microphone...');
-
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-    video: false,
-  });
-
-  this.mediaStream = stream;
-
-  console.log('🎤 Microphone opened');
-
-  const AudioContextClass =
-    (window as any).AudioContext ||
-    (window as any).webkitAudioContext;
-
-  if (!AudioContextClass) {
-    stream.getTracks().forEach(track => track.stop());
-    this.mediaStream = null;
-
-    throw new Error('Web Audio API is not supported');
-  }
-
-  const audioContext: AudioContext =
-    new AudioContextClass();
-
-  this.audioContext = audioContext;
-
-  if (audioContext.state === 'suspended') {
-    await audioContext.resume();
-  }
-
-  const source =
-    audioContext.createMediaStreamSource(stream);
-
-  const analyser =
-    audioContext.createAnalyser();
-
-  analyser.fftSize = 2048;
-  analyser.smoothingTimeConstant = 0.2;
-
-  source.connect(analyser);
-
-  this.analyser = analyser;
-
-  console.log('🎤 Audio analyser ready');
-}
-
-  // ============================================================
-  // VAD
-  // ============================================================
-
+  /**
+   * Start simple RMS-based voice activity detection.
+   */
   private startVAD(): void {
+    if (!this.mediaStream) {
+      return;
+    }
+
     this.stopVAD();
 
-    this.vadTimer = setInterval(() => {
-      this.checkAudioLevel();
-    }, this.VAD_INTERVAL_MS);
+    this.audioContext = new AudioContext();
+
+    const source =
+      this.audioContext.createMediaStreamSource(
+        this.mediaStream,
+      );
+
+    this.analyser =
+      this.audioContext.createAnalyser();
+
+    this.analyser.fftSize = 2048;
+
+    source.connect(this.analyser);
+
+    const data = new Uint8Array(
+      this.analyser.fftSize,
+    );
+
+    const check = () => {
+      if (
+        !this.wantRunning ||
+        !this.analyser
+      ) {
+        return;
+      }
+
+      this.analyser.getByteTimeDomainData(data);
+
+      let sum = 0;
+
+      for (let i = 0; i < data.length; i++) {
+        const value =
+          (data[i] - 128) / 128;
+
+        sum += value * value;
+      }
+
+      const rms = Math.sqrt(
+        sum / data.length,
+      );
+
+      /*
+       * Voice activity threshold.
+       */
+      const SPEECH_THRESHOLD = 0.035;
+
+      if (rms > SPEECH_THRESHOLD) {
+        this.handleSpeechDetected();
+      }
+
+      this.vadFrame =
+        requestAnimationFrame(check);
+    };
+
+    this.vadFrame =
+      requestAnimationFrame(check);
   }
 
+  /**
+   * Stop VAD.
+   */
   private stopVAD(): void {
-    if (this.vadTimer) {
-      clearInterval(this.vadTimer);
-      this.vadTimer = null;
-    }
-  }
+    if (this.vadFrame !== undefined) {
+      cancelAnimationFrame(
+        this.vadFrame,
+      );
 
-  private checkAudioLevel(): void {
-  if (
-    !this.wantRunning ||
-    this.processing ||
-    !this.analyser
-  ) {
-    return;
-  }
-
-  const analyser = this.analyser;
-
-  const bufferLength = analyser.fftSize;
-  const data = new Uint8Array(bufferLength);
-
-  analyser.getByteTimeDomainData(data);
-
-  let sum = 0;
-
-  for (let i = 0; i < data.length; i++) {
-    const normalized =
-      (data[i] - 128) / 128;
-
-    sum += normalized * normalized;
-  }
-
-  const rms =
-    Math.sqrt(sum / data.length);
-
-  const speaking =
-    rms > this.SPEECH_THRESHOLD;
-
-  const now = Date.now();
-
-  if (speaking) {
-    this.lastSpeechAt = now;
-
-    if (!this.mediaRecorder) {
-      this.beginRecording();
+      this.vadFrame = undefined;
     }
 
-    return;
+    if (this.silenceTimer) {
+      clearTimeout(
+        this.silenceTimer,
+      );
+
+      this.silenceTimer = undefined;
+    }
+
+    if (this.audioContext) {
+      void this.audioContext
+        .close()
+        .catch(() => {});
+
+      this.audioContext = undefined;
+    }
+
+    this.analyser = undefined;
   }
 
-  if (!this.mediaRecorder) {
-    return;
-  }
+  /**
+   * Called whenever VAD detects speech.
+   */
+  private handleSpeechDetected(): void {
+    if (!this.wantRunning) {
+      return;
+    }
 
-  const elapsedSinceSpeech =
-    now - this.lastSpeechAt;
-
-  const recordingDuration =
-    now - this.recordingStartedAt;
-
-  if (
-    recordingDuration >= this.MIN_RECORDING_MS &&
-    elapsedSinceSpeech >= this.SILENCE_MS
-  ) {
-    this.finishRecording();
-  }
-}
-
-  // ============================================================
-  // RECORDING
-  // ============================================================
-
-  private beginRecording(): void {
     if (
-      !this.mediaStream ||
-      this.mediaRecorder ||
-      this.processing
+      this.mediaRecorder?.state ===
+      'recording'
+    ) {
+      this.restartSilenceTimer();
+      return;
+    }
+
+    this.startRecording();
+  }
+
+  /**
+   * Begin recording one utterance.
+   */
+  private startRecording(): void {
+    if (!this.mediaStream) {
+      return;
+    }
+
+    if (
+      this.mediaRecorder?.state ===
+      'recording'
     ) {
       return;
     }
 
-    const mimeType = this.getSupportedMimeType();
+    this.chunks = [];
 
-    console.log(
-      '🎙️ Starting recording:',
-      mimeType || 'browser default'
-    );
+    let mimeType = '';
+
+    if (
+      MediaRecorder.isTypeSupported(
+        'audio/webm;codecs=opus',
+      )
+    ) {
+      mimeType =
+        'audio/webm;codecs=opus';
+    } else if (
+      MediaRecorder.isTypeSupported(
+        'audio/webm',
+      )
+    ) {
+      mimeType = 'audio/webm';
+    } else if (
+      MediaRecorder.isTypeSupported(
+        'audio/mp4',
+      )
+    ) {
+      mimeType = 'audio/mp4';
+    }
 
     try {
       this.mediaRecorder = mimeType
-        ? new MediaRecorder(this.mediaStream, {
-            mimeType,
-          })
-        : new MediaRecorder(this.mediaStream);
+        ? new MediaRecorder(
+            this.mediaStream,
+            { mimeType },
+          )
+        : new MediaRecorder(
+            this.mediaStream,
+          );
     } catch (error) {
       console.error(
-        '❌ MediaRecorder creation failed:',
-        error
+        '❌ Could not create MediaRecorder:',
+        error,
       );
 
-      this.mediaRecorder = null;
       return;
     }
 
-    this.audioChunks = [];
+    this.mediaRecorder.ondataavailable =
+      (event: BlobEvent) => {
+        if (event.data.size > 0) {
+          this.chunks.push(
+            event.data,
+          );
+        }
+      };
 
-    this.recordingStartedAt = Date.now();
-    this.lastSpeechAt = Date.now();
+    this.mediaRecorder.onstop = () => {
+      const type =
+        this.mediaRecorder?.mimeType ||
+        mimeType ||
+        'audio/webm';
 
-    const recorder = this.mediaRecorder;
+      const blob = new Blob(
+        this.chunks,
+        { type },
+      );
 
-    recorder.ondataavailable = (event: BlobEvent) => {
-      if (event.data && event.data.size > 0) {
-        this.audioChunks.push(event.data);
+      this.chunks = [];
+
+      if (blob.size > 0) {
+        void this.transcribe(blob);
       }
     };
 
-    recorder.onerror = (event: any) => {
-      console.error(
-        '❌ MediaRecorder error:',
-        event
-      );
-    };
+    this.mediaRecorder.onerror =
+      (event) => {
+        console.error(
+          '❌ MediaRecorder error:',
+          event,
+        );
+      };
 
-    recorder.onstop = () => {
-      this.handleRecordingStopped();
-    };
-
-    try {
-      recorder.start();
-    } catch (error) {
-      console.error(
-        '❌ MediaRecorder.start() failed:',
-        error
-      );
-
-      this.mediaRecorder = null;
-      this.audioChunks = [];
-    }
-  }
-
-  private finishRecording(): void {
-    if (!this.mediaRecorder) {
-      return;
-    }
-
-    console.log('🎙️ Speech ended, stopping recording');
-
-    try {
-      this.mediaRecorder.stop();
-    } catch (error) {
-      console.error(
-        '❌ MediaRecorder.stop() failed:',
-        error
-      );
-
-      this.mediaRecorder = null;
-      this.audioChunks = [];
-    }
-  }
-
-  private async handleRecordingStopped(): Promise<void> {
-    const recorder = this.mediaRecorder;
-
-    this.mediaRecorder = null;
-
-    if (!recorder) {
-      return;
-    }
-
-    if (!this.audioChunks.length) {
-      return;
-    }
-
-    const mimeType =
-      recorder.mimeType ||
-      this.getSupportedMimeType() ||
-      'audio/webm';
-
-    const blob = new Blob(
-      this.audioChunks,
-      { type: mimeType }
-    );
-
-    this.audioChunks = [];
+    this.mediaRecorder.start();
 
     console.log(
-      '🎙️ Recorded audio:',
-      blob.size,
-      'bytes',
-      blob.type
+      '🎙️ Recording started',
     );
 
-    if (blob.size < 1000) {
-      console.log('🎙️ Recording too small, ignoring');
-      return;
-    }
-
-    await this.transcribe(blob);
+    this.restartSilenceTimer();
   }
 
-  // ============================================================
-  // MIME TYPE
-  // ============================================================
-
-  private getSupportedMimeType(): string {
-    const types = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/mp4',
-      'audio/ogg;codecs=opus',
-      'audio/ogg',
-    ];
-
-    for (const type of types) {
-      if (
-        typeof MediaRecorder !== 'undefined' &&
-        MediaRecorder.isTypeSupported(type)
-      ) {
-        return type;
-      }
-    }
-
-    return '';
-  }
-
-  // ============================================================
-  // GEMINI / SPRING BOOT
-  // ============================================================
-
-  private async transcribe(blob: Blob): Promise<void> {
-    if (this.processing) {
-      console.log(
-        '⏳ Already transcribing, ignoring recording'
+  /**
+   * Reset silence timer while speech continues.
+   */
+  private restartSilenceTimer(): void {
+    if (this.silenceTimer) {
+      clearTimeout(
+        this.silenceTimer,
       );
-      return;
     }
 
-    this.processing = true;
+    /*
+     * 1.2 seconds of silence ends
+     * the current utterance.
+     */
+    this.silenceTimer =
+      setTimeout(() => {
+        this.stopRecording();
+      }, 1200);
+  }
 
-    this.zone.run(() => {
-      this.status.set('Processing…');
-    });
+  /**
+   * Stop current utterance recording.
+   */
+  private stopRecording(): void {
+    if (this.silenceTimer) {
+      clearTimeout(
+        this.silenceTimer,
+      );
+
+      this.silenceTimer = undefined;
+    }
+
+    if (
+      this.mediaRecorder &&
+      this.mediaRecorder.state ===
+        'recording'
+    ) {
+      console.log(
+        '🎙️ Recording stopped',
+      );
+
+      this.mediaRecorder.stop();
+    }
+  }
+
+  /**
+   * Send recorded audio to Gemini transcription backend.
+   */
+  private async transcribe(
+    blob: Blob,
+  ): Promise<void> {
+    console.log(
+      `🎤 Sending audio for transcription: ${blob.size} bytes, ${blob.type}`,
+    );
 
     try {
+      const formData =
+        new FormData();
+
       const extension =
-        this.getFileExtension(blob.type);
+        this.getExtension(
+          blob.type,
+        );
 
       const file = new File(
         [blob],
         `voice.${extension}`,
         {
-          type: blob.type || 'audio/webm',
-        }
+          type:
+            blob.type ||
+            'audio/webm',
+        },
       );
-
-      const formData = new FormData();
 
       formData.append(
         'audio',
-        file
+        file,
       );
 
-      console.log(
-        '☁️ Sending audio to Spring Boot:',
-        this.TRANSCRIBE_URL
-      );
-
-      const response = await fetch(
-        this.TRANSCRIBE_URL,
-        {
-          method: 'POST',
-          body: formData,
-        }
-      );
+      const response =
+        await fetch(
+          `${this.API_BASE}/api/voice/transcribe`,
+          {
+            method: 'POST',
+            body: formData,
+          },
+        );
 
       if (!response.ok) {
         const errorText =
           await response.text();
 
         throw new Error(
-          `HTTP ${response.status}: ${errorText}`
+          errorText ||
+            `Transcription failed: ${response.status}`,
         );
       }
 
       const result =
         await response.json();
 
+      const text = String(
+        result.text || '',
+      ).trim();
+
       console.log(
-        '☁️ Transcription response:',
-        result
+        '🎤 Transcription:',
+        text,
       );
 
-      const text =
-        typeof result === 'string'
-          ? result
-          : result?.text ||
-            result?.transcript ||
-            '';
-
-      const transcript =
-        String(text).trim();
-
-      if (!transcript) {
-        console.log(
-          '☁️ Gemini returned empty transcript'
-        );
-
+      if (!text) {
         return;
       }
 
       this.zone.run(() => {
-        this.handleTranscript(transcript);
+        this.transcript.set(
+          text,
+        );
       });
-    } catch (error: any) {
+
+      this.handleTranscript(
+        text,
+      );
+    } catch (error) {
       console.error(
         '❌ Voice transcription failed:',
-        error
+        error,
       );
 
       this.zone.run(() => {
-        this.status.set(
-          'Voice service unavailable'
-        );
+        if (
+          this.confirmationMode
+        ) {
+          this.status.set(
+            'Listening for confirmation…',
+          );
+        } else if (
+          this.armed()
+        ) {
+          this.status.set(
+            'Listening…',
+          );
+        } else {
+          this.status.set(
+            'Listening for “hey toto”',
+          );
+        }
       });
-    } finally {
-      this.processing = false;
-
-      if (this.wantRunning) {
-        this.zone.run(() => {
-          if (this.armed()) {
-            this.status.set('Listening…');
-          } else {
-            this.status.set(
-              'Listening for “hey toto”'
-            );
-          }
-        });
-      }
     }
   }
 
-  // ============================================================
-  // TRANSCRIPT HANDLING
-  // ============================================================
+  /**
+   * Process completed transcription.
+   */
+  private handleTranscript(
+    text: string,
+  ): void {
+    const cleanText =
+      text.trim();
 
-  private handleTranscript(text: string): void {
+    if (!cleanText) {
+      return;
+    }
+
     console.log(
-      '🗣️ Gemini transcript:',
-      text
+      '🎤 Handling transcript:',
+      cleanText,
+      'confirmationMode:',
+      this.confirmationMode,
+      'armed:',
+      this.armed(),
     );
 
-    this.transcript.set(text);
-
-    // ----------------------------------------------------------
-    // WAKE WORD MODE
-    // ----------------------------------------------------------
-
-    if (!this.armed()) {
-      this.wakeBuffer =
-        `${this.wakeBuffer} ${text}`
-          .trim()
-          .slice(-300);
-
-      console.log(
-        '👂 Wake buffer:',
-        this.wakeBuffer
-      );
-
-      const result =
-        matchWakeWord(this.wakeBuffer);
-
-      if (!result.hit) {
-        this.status.set(
-          'Listening for “hey toto”'
-        );
-
-        return;
-      }
+    /*
+     * =====================================================
+     * CONFIRMATION MODE
+     * =====================================================
+     *
+     * This MUST come before wake-word handling.
+     *
+     * Example:
+     *
+     * MiniMe:
+     *   "I can open Google Chrome. Should I?"
+     *
+     * User:
+     *   "yes"
+     *
+     * Result:
+     *
+     *   submitCommand("yes")
+     *
+     * AppComponent then handles the pending action.
+     */
+    if (this.confirmationMode) {
+      this.confirmationMode = false;
 
       console.log(
-        '🟢 Wake word detected:',
-        'hey toto'
+        '✅ Confirmation response received:',
+        cleanText,
       );
 
-      this.armed.set(true);
-
-      this.status.set(
-        'Listening…'
+      this.submitCommand(
+        cleanText,
       );
 
-      this.wakeBuffer = '';
+      return;
+    }
 
-      const rest =
-        (result.rest || '').trim();
+    /*
+     * =====================================================
+     * MANUAL MICROPHONE MODE
+     * =====================================================
+     */
+    if (this.armed()) {
+      this.submitCommand(
+        cleanText,
+      );
 
-      this.transcript.set(rest);
+      return;
+    }
 
-      /**
-       * If the same recording contained:
-       *
-       * "hey toto open my calendar"
-       *
-       * then result.rest will already contain
-       * the command.
+    /*
+     * =====================================================
+     * NORMAL WAKE WORD MODE
+     * =====================================================
+     */
+
+    this.wakeBuffer =
+      `${this.wakeBuffer} ${cleanText}`
+        .trim()
+        .replace(/\s+/g, ' ');
+
+    console.log(
+      '👂 Wake buffer:',
+      this.wakeBuffer,
+    );
+
+    const wakeMatch =
+      this.matchWakeWord(
+        this.wakeBuffer,
+      );
+
+    if (!wakeMatch) {
+      /*
+       * Prevent buffer from growing forever.
        */
-      if (rest) {
-        this.submitCommand(rest);
+      if (
+        this.wakeBuffer.length >
+        100
+      ) {
+        this.wakeBuffer =
+          this.wakeBuffer.slice(
+            -100,
+          );
       }
 
       return;
     }
 
-    // ----------------------------------------------------------
-    // COMMAND MODE
-    // ----------------------------------------------------------
+    const rest =
+      this.wakeBuffer
+        .slice(
+          wakeMatch.index +
+            wakeMatch.word.length,
+        )
+        .trim();
 
-    this.submitCommand(text);
+    console.log(
+      '👋 Wake word detected. Remaining command:',
+      rest,
+    );
+
+    this.wakeBuffer = '';
+
+    /*
+     * We heard:
+     *
+     * "Hey Toto"
+     *
+     * Give acknowledgement.
+     */
+    this.zone.run(() => {
+      this.armed.set(false);
+      this.transcript.set('');
+      this.status.set(
+        'Speaking…',
+      );
+    });
+
+    this.speak(
+      'yes Leena',
+      () => {
+        if (!this.wantRunning) {
+          return;
+        }
+
+        this.zone.run(() => {
+          this.armed.set(true);
+          this.status.set(
+            'Listening…',
+          );
+        });
+
+        /*
+         * If command was:
+         *
+         * "Hey Toto, open Chrome"
+         *
+         * then submit the command
+         * immediately.
+         */
+        if (rest) {
+          this.submitCommand(
+            rest,
+          );
+        }
+      },
+    );
   }
 
-  private submitCommand(text: string): void {
+  /**
+   * Submit command to AppComponent.
+   */
+  private submitCommand(
+    text: string,
+  ): void {
     const command =
       text.trim();
 
@@ -640,179 +878,128 @@ export class VoiceService {
 
     console.log(
       '🚀 Submitting voice command:',
-      command
+      command,
     );
 
+    /*
+     * Clear all temporary voice modes.
+     */
+    this.confirmationMode = false;
     this.armed.set(false);
     this.transcript.set('');
     this.wakeBuffer = '';
 
-    this.status.set(
-      'Listening for “hey toto”'
-    );
+    this.zone.run(() => {
+      this.status.set(
+        'Listening for “hey toto”',
+      );
+    });
 
-    this.onCommand(command);
+    try {
+      const result =
+        this.onCommand?.(
+          command,
+        );
+
+      if (
+        result instanceof Promise
+      ) {
+        void result.catch(
+          (error) => {
+            console.error(
+              '❌ Voice command handler failed:',
+              error,
+            );
+          },
+        );
+      }
+    } catch (error) {
+      console.error(
+        '❌ Voice command handler failed:',
+        error,
+      );
+    }
   }
 
-  // ============================================================
-  // STOP
-  // ============================================================
+  /**
+   * Find wake word in accumulated transcript.
+   */
+  private matchWakeWord(
+    text: string,
+  ): {
+    index: number;
+    word: string;
+  } | null {
+    const lower =
+      text.toLowerCase();
 
-  stop(): void {
-    console.log(
-      '🛑 Stopping VoiceService'
-    );
+    let best:
+      | {
+          index: number;
+          word: string;
+        }
+      | null = null;
 
-    this.wantRunning = false;
-    this.processing = false;
+    for (
+      const word of this.wakeWords
+    ) {
+      const index =
+        lower.indexOf(word);
 
-    this.stopVAD();
-
-    this.armed.set(false);
-    this.wakeBuffer = '';
-    this.transcript.set('');
-
-    if (this.mediaRecorder) {
-      try {
-        this.mediaRecorder.stop();
-      } catch {}
-
-      this.mediaRecorder = null;
-    }
-
-    if (this.mediaStream) {
-      for (const track of this.mediaStream.getTracks()) {
-        try {
-          track.stop();
-        } catch {}
+      if (index === -1) {
+        continue;
       }
 
-      this.mediaStream = null;
+      if (
+        !best ||
+        index < best.index
+      ) {
+        best = {
+          index,
+          word,
+        };
+      }
     }
 
-    if (this.audioContext) {
-      try {
-        this.audioContext.close();
-      } catch {}
-
-      this.audioContext = null;
-    }
-
-    this.analyser = null;
-    this.audioChunks = [];
-
-    this.zone.run(() => {
-      this.listening.set(false);
-      this.status.set('Idle');
-    });
+    return best;
   }
 
-  // ============================================================
-  // TOGGLE
-  // ============================================================
-
-  toggle(): void {
-    if (this.wantRunning) {
-      this.stop();
-    } else {
-      void this.start();
-    }
-  }
-
-  // ============================================================
-  // MANUAL MICROPHONE BUTTON
-  // ============================================================
-
-  async arm(): Promise<void> {
-    if (!this.wantRunning) {
-      await this.start();
-    }
-
-    this.wakeBuffer = '';
-    this.armed.set(true);
-    this.transcript.set('');
-
-    this.zone.run(() => {
-      this.status.set('Listening…');
-    });
-
-    console.log(
-      '🎤 Manual voice mode armed'
-    );
-  }
-
-  // ============================================================
-  // FILE EXTENSION
-  // ============================================================
-
-  private getFileExtension(
-    mimeType: string
+  /**
+   * Convert MIME type to file extension.
+   */
+  private getExtension(
+    mimeType: string,
   ): string {
-    const mime =
+    const type =
       mimeType.toLowerCase();
 
-    if (mime.includes('mp4')) {
-      return 'm4a';
-    }
-
-    if (mime.includes('ogg')) {
-      return 'ogg';
-    }
-
-    if (mime.includes('wav')) {
+    if (type.includes('wav')) {
       return 'wav';
     }
 
-    if (mime.includes('mpeg')) {
+    if (
+      type.includes('mpeg') ||
+      type.includes('mp3')
+    ) {
       return 'mp3';
     }
 
-    if (mime.includes('aac')) {
+    if (type.includes('mp4')) {
+      return 'mp4';
+    }
+
+    if (type.includes('ogg')) {
+      return 'ogg';
+    }
+
+    if (type.includes('flac')) {
+      return 'flac';
+    }
+
+    if (type.includes('aac')) {
       return 'aac';
     }
 
     return 'webm';
-  }
-
-  // ============================================================
-  // TEXT TO SPEECH
-  // ============================================================
-
-  speak(
-    text: string,
-    onDone?: () => void
-  ): void {
-    if (!('speechSynthesis' in window)) {
-      return;
-    }
-
-    window.speechSynthesis.cancel();
-
-    const utterance =
-      new SpeechSynthesisUtterance(text);
-
-    utterance.rate = 1.02;
-
-    utterance.onstart = () => {
-      this.zone.run(() => {
-        this.status.set(
-          'Speaking…'
-        );
-      });
-    };
-
-    utterance.onend = () => {
-      this.zone.run(() => {
-        this.status.set(
-          'Listening for “hey toto”'
-        );
-
-        onDone?.();
-      });
-    };
-
-    window.speechSynthesis.speak(
-      utterance
-    );
   }
 }

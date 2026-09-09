@@ -5,11 +5,27 @@ const {
   screen,
   systemPreferences,
   session,
+  desktopCapturer,
 } = require('electron');
 
 const path = require('path');
+const { execFile } = require('child_process');
 
-let win;
+const ALLOWED_APPS = new Set([
+  'Google Chrome',
+  'Safari',
+  'Visual Studio Code',
+  'Terminal',
+  'Finder',
+  'Notes',
+  'Calendar',
+  'Mail',
+  'Messages',
+  'Slack',
+  'WhatsApp',
+]);
+
+let win = null;
 
 const COLLAPSED = {
   width: 180,
@@ -17,17 +33,25 @@ const COLLAPSED = {
 };
 
 const EXPANDED = {
-  width: 460,
-  height: 720,
+  width: 520,
+  height: 820,
 };
 
 function getBottomRightPosition(width, height) {
-  const { workArea } = screen.getPrimaryDisplay();
+  const display = screen.getPrimaryDisplay();
+  const { workArea } = display;
 
-  return {
-    x: workArea.x + workArea.width - width - 24,
-    y: workArea.y + workArea.height - height - 24,
-  };
+  const x = Math.max(
+    workArea.x,
+    workArea.x + workArea.width - width - 24
+  );
+
+  const y = Math.max(
+    workArea.y,
+    workArea.y + workArea.height - height - 24
+  );
+
+  return { x, y };
 }
 
 function createWindow() {
@@ -62,11 +86,46 @@ function createWindow() {
     },
   });
 
+  /*
+   * MiniMe currently runs from Angular's development server.
+   */
   win.loadURL('http://localhost:4200/');
   win.webContents.openDevTools();
 
+  /*
+   * Show the window as soon as Electron has something to display.
+   */
   win.once('ready-to-show', () => {
+    if (!win) return;
+
     win.show();
+    win.focus();
+
+    console.log('🟢 MiniMe window shown');
+    console.log('📐 Bounds:', win.getBounds());
+  });
+
+  /*
+   * Useful diagnostics if Angular fails to load.
+   */
+  win.webContents.on('did-finish-load', () => {
+    console.log('✅ MiniMe Angular page loaded');
+  });
+
+  win.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedURL) => {
+      console.error(
+        '❌ MiniMe failed to load:',
+        errorCode,
+        errorDescription,
+        validatedURL
+      );
+    }
+  );
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error('❌ MiniMe renderer stopped:', details);
   });
 
   win.setAlwaysOnTop(true, 'floating');
@@ -84,23 +143,102 @@ function createWindow() {
    ===================================================== */
 
 ipcMain.on('minime:resize', (_event, expanded) => {
+
   if (!win) return;
 
   const size = expanded ? EXPANDED : COLLAPSED;
+
+  win.setSize(size.width, size.height);
 
   const position = getBottomRightPosition(
     size.width,
     size.height
   );
 
-  win.setBounds({
-    x: position.x,
-    y: position.y,
-    width: size.width,
-    height: size.height,
-  });
+  win.setPosition(position.x, position.y);
 
   win.setAlwaysOnTop(true, 'floating');
+
+});
+
+
+/* =====================================================
+   COMPUTER CONTROL — OPEN APP
+   ===================================================== */
+
+ipcMain.handle('minime:open-app', async (_event, appName) => {
+  if (process.platform !== 'darwin') {
+    throw new Error(
+      'Opening apps through MiniMe is currently implemented for macOS.'
+    );
+  }
+
+  const name = String(appName || '').trim();
+
+  if (!name) {
+    throw new Error('No application name was provided.');
+  }
+
+  if (!ALLOWED_APPS.has(name)) {
+    throw new Error(
+      `App "${name}" is not allowed.`
+    );
+  }
+
+  console.log(`🖥️ MiniMe opening app: ${name}`);
+
+  return new Promise((resolve, reject) => {
+    execFile('open', ['-a', name], (error, _stdout, stderr) => {
+      if (error) {
+        console.error(
+          `❌ Could not open ${name}:`,
+          stderr || error.message
+        );
+
+        reject(new Error(stderr || error.message));
+        return;
+      }
+
+      console.log(`✅ Opened app: ${name}`);
+
+      resolve({
+        ok: true,
+        action: 'OPEN_APP',
+        app: name,
+      });
+    });
+  });
+});
+
+
+/* =====================================================
+   SCREEN CAPTURE
+   ===================================================== */
+
+ipcMain.handle('minime:screen-capture', async () => {
+  const primaryDisplay = screen.getPrimaryDisplay();
+
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: {
+      width: 1920,
+      height: 1080,
+    },
+  });
+
+  const source =
+    sources.find(
+      (s) => String(s.display_id) === String(primaryDisplay.id)
+    ) || sources[0];
+
+  if (!source) {
+    throw new Error('No screen source found');
+  }
+
+  return {
+    imageBase64: source.thumbnail.toPNG().toString('base64'),
+    mimeType: 'image/png',
+  };
 });
 
 
@@ -109,7 +247,6 @@ ipcMain.on('minime:resize', (_event, expanded) => {
    ===================================================== */
 
 app.whenReady().then(async () => {
-
   /*
    * macOS microphone permission
    */
@@ -127,14 +264,15 @@ app.whenReady().then(async () => {
     }
   }
 
-
-
   /*
    * Chromium media permission
    */
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, permission, callback) => {
-      if (permission === 'media') {
+      if (
+        permission === 'media' ||
+        permission === 'audioCapture'
+      ) {
         callback(true);
         return;
       }
@@ -143,29 +281,28 @@ app.whenReady().then(async () => {
     }
   );
 
-
   /*
    * Chromium permission check
    */
   session.defaultSession.setPermissionCheckHandler(
     (_webContents, permission) => {
-      return permission === 'media';
+      return (
+        permission === 'media' ||
+        permission === 'audioCapture'
+      );
     }
   );
 
-
   /*
-   * Start Orb
+   * Start MiniMe.
    */
   createWindow();
-
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     }
   });
-
 });
 
 
