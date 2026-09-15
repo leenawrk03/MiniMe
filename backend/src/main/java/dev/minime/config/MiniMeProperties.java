@@ -13,6 +13,7 @@ public class MiniMeProperties {
     private String systemPrompt = "You are MiniMe, a helpful personal companion.";
     private Gemini gemini = new Gemini();
     private Memory memory = new Memory();
+    private Mcp mcp = new Mcp();
 
     public static class Gemini {
         private String apiKey = "";
@@ -114,6 +115,34 @@ public class MiniMeProperties {
         public void setDuplicateSimilarity(double duplicateSimilarity) { this.duplicateSimilarity = duplicateSimilarity; }
     }
 
+    /** MCP client/server wiring. */
+    public static class Mcp {
+        private GitHub github = new GitHub();
+
+        public GitHub getGithub() { return github; }
+        public void setGithub(GitHub github) { this.github = github; }
+
+        /** Client config for the GitHub MCP server (github/github-mcp-server, run via Docker). */
+        public static class GitHub {
+            /** Off by default: no Docker container listening means no wasted connection attempts. */
+            private boolean enabled = false;
+            private String endpoint = "http://localhost:8086/mcp";
+            /**
+             * Personal access token forwarded as a Bearer token to the GitHub MCP
+             * server. Only needed if the server itself isn't already configured
+             * with GITHUB_PERSONAL_ACCESS_TOKEN.
+             */
+            private String token = "";
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+            public String getEndpoint() { return endpoint; }
+            public void setEndpoint(String endpoint) { this.endpoint = endpoint; }
+            public String getToken() { return token; }
+            public void setToken(String token) { this.token = token; }
+        }
+    }
+
     public String getConversationId() { return conversationId; }
     public void setConversationId(String conversationId) { this.conversationId = conversationId; }
     public String getSystemPrompt() { return systemPrompt; }
@@ -122,4 +151,6 @@ public class MiniMeProperties {
     public void setGemini(Gemini gemini) { this.gemini = gemini; }
     public Memory getMemory() { return memory; }
     public void setMemory(Memory memory) { this.memory = memory; }
+    public Mcp getMcp() { return mcp; }
+    public void setMcp(Mcp mcp) { this.mcp = mcp; }
 }

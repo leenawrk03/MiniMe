@@ -120,7 +120,7 @@ public class McpServerConfig {
                         .toolCall(
                                 openApplicationTool,
                                 (exchange, request) -> {
-
+                                    System.out.println(">>> MCP TOOL CALLED: open_application");
                                     Object rawAppName =
                                             request.arguments()
                                                     .get("appName");

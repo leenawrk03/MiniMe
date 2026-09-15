@@ -35,18 +35,6 @@ export class VoiceService {
   ];
 
   /**
-   * True when MiniMe is waiting for a direct confirmation.
-   *
-   * Example:
-   *
-   * MiniMe: "I can open Google Chrome. Should I?"
-   * User:   "yes"
-   *
-   * In confirmation mode, "yes" is submitted directly.
-   */
-  private confirmationMode = false;
-
-  /**
    * Called by AppComponent whenever a voice command is ready.
    */
   onCommand?: (text: string) => void | Promise<void>;
@@ -62,7 +50,6 @@ export class VoiceService {
     }
 
     this.wantRunning = true;
-    this.confirmationMode = false;
 
     try {
       await this.ensureMicrophone();
@@ -95,7 +82,6 @@ export class VoiceService {
    */
   stop(): void {
     this.wantRunning = false;
-    this.confirmationMode = false;
     this.wakeBuffer = '';
 
     this.stopRecording();
@@ -123,13 +109,6 @@ export class VoiceService {
    * Manually enter command mode from the microphone button.
    */
   arm(): void {
-    /*
-     * IMPORTANT:
-     *
-     * Do not require wantRunning here.
-     *
-     * If the microphone stream already exists, simply arm it.
-     */
     if (!this.mediaStream) {
       console.warn(
         '🎤 Cannot arm manually because microphone is not available.',
@@ -137,7 +116,6 @@ export class VoiceService {
       return;
     }
 
-    this.confirmationMode = false;
     this.wakeBuffer = '';
 
     this.zone.run(() => {
@@ -147,51 +125,6 @@ export class VoiceService {
     });
 
     console.log('🎤 Manual voice mode armed');
-  }
-
-  /**
-   * Enter direct confirmation mode.
-   *
-   * This is called by AppComponent after MiniMe asks:
-   *
-   * "I can open Google Chrome. Should I?"
-   *
-   * The next transcript is accepted directly.
-   *
-   * It does NOT require:
-   * "Hey Toto"
-   */
-  listenForConfirmation(): void {
-    /*
-     * IMPORTANT FIX:
-     *
-     * Previously this method returned when wantRunning was false.
-     *
-     * That could leave confirmationMode disabled, meaning
-     * "yes" would be treated as normal speech instead of
-     * being sent to AppComponent.
-     *
-     * If the microphone stream is already available, we can
-     * safely enable confirmation mode.
-     */
-    if (!this.mediaStream) {
-      console.warn(
-        '🎤 Confirmation requested but microphone is unavailable.',
-      );
-
-      return;
-    }
-
-    this.confirmationMode = true;
-    this.wakeBuffer = '';
-
-    this.zone.run(() => {
-      this.armed.set(true);
-      this.transcript.set('');
-      this.status.set('Listening for confirmation…');
-    });
-
-    console.log('🎤 Confirmation mode armed');
   }
 
   /**
@@ -219,15 +152,6 @@ export class VoiceService {
       };
 
       utterance.onend = () => {
-        /*
-         * Run callback FIRST.
-         *
-         * AppComponent may call:
-         *
-         * listenForConfirmation()
-         *
-         * which sets confirmationMode = true.
-         */
         try {
           onDone?.();
         } catch (error) {
@@ -238,9 +162,7 @@ export class VoiceService {
         }
 
         this.zone.run(() => {
-          if (this.confirmationMode) {
-            this.status.set('Listening for confirmation…');
-          } else if (this.armed()) {
+          if (this.armed()) {
             this.status.set('Listening…');
           } else {
             this.status.set('Listening for “hey toto”');
@@ -264,9 +186,7 @@ export class VoiceService {
         }
 
         this.zone.run(() => {
-          if (this.confirmationMode) {
-            this.status.set('Listening for confirmation…');
-          } else if (this.armed()) {
+          if (this.armed()) {
             this.status.set('Listening…');
           } else {
             this.status.set('Listening for “hey toto”');
@@ -291,9 +211,7 @@ export class VoiceService {
       }
 
       this.zone.run(() => {
-        if (this.confirmationMode) {
-          this.status.set('Listening for confirmation…');
-        } else if (this.armed()) {
+        if (this.armed()) {
           this.status.set('Listening…');
         } else {
           this.status.set('Listening for “hey toto”');
@@ -373,9 +291,6 @@ export class VoiceService {
         sum / data.length,
       );
 
-      /*
-       * Voice activity threshold.
-       */
       const SPEECH_THRESHOLD = 0.035;
 
       if (rms > SPEECH_THRESHOLD) {
@@ -552,10 +467,6 @@ export class VoiceService {
       );
     }
 
-    /*
-     * 1.2 seconds of silence ends
-     * the current utterance.
-     */
     this.silenceTimer =
       setTimeout(() => {
         this.stopRecording();
@@ -657,14 +568,10 @@ export class VoiceService {
       }
 
       this.zone.run(() => {
-        this.transcript.set(
-          text,
-        );
+        this.transcript.set(text);
       });
 
-      this.handleTranscript(
-        text,
-      );
+      this.handleTranscript(text);
     } catch (error) {
       console.error(
         '❌ Voice transcription failed:',
@@ -672,18 +579,8 @@ export class VoiceService {
       );
 
       this.zone.run(() => {
-        if (
-          this.confirmationMode
-        ) {
-          this.status.set(
-            'Listening for confirmation…',
-          );
-        } else if (
-          this.armed()
-        ) {
-          this.status.set(
-            'Listening…',
-          );
+        if (this.armed()) {
+          this.status.set('Listening…');
         } else {
           this.status.set(
             'Listening for “hey toto”',
@@ -695,6 +592,13 @@ export class VoiceService {
 
   /**
    * Process completed transcription.
+   *
+   * There is NO confirmation mode here.
+   *
+   * Every completed command is either:
+   *
+   * 1. A manually armed command, or
+   * 2. A wake-word command.
    */
   private handleTranscript(
     text: string,
@@ -709,47 +613,9 @@ export class VoiceService {
     console.log(
       '🎤 Handling transcript:',
       cleanText,
-      'confirmationMode:',
-      this.confirmationMode,
       'armed:',
       this.armed(),
     );
-
-    /*
-     * =====================================================
-     * CONFIRMATION MODE
-     * =====================================================
-     *
-     * This MUST come before wake-word handling.
-     *
-     * Example:
-     *
-     * MiniMe:
-     *   "I can open Google Chrome. Should I?"
-     *
-     * User:
-     *   "yes"
-     *
-     * Result:
-     *
-     *   submitCommand("yes")
-     *
-     * AppComponent then handles the pending action.
-     */
-    if (this.confirmationMode) {
-      this.confirmationMode = false;
-
-      console.log(
-        '✅ Confirmation response received:',
-        cleanText,
-      );
-
-      this.submitCommand(
-        cleanText,
-      );
-
-      return;
-    }
 
     /*
      * =====================================================
@@ -786,9 +652,6 @@ export class VoiceService {
       );
 
     if (!wakeMatch) {
-      /*
-       * Prevent buffer from growing forever.
-       */
       if (
         this.wakeBuffer.length >
         100
@@ -839,32 +702,46 @@ export class VoiceService {
           return;
         }
 
+        /*
+         * If the wake phrase contained
+         * the command:
+         *
+         * "Hey Toto, open Chrome"
+         *
+         * submit it immediately.
+         */
+        if (rest) {
+          this.submitCommand(
+            rest,
+          );
+
+          return;
+        }
+
+        /*
+         * If only "Hey Toto" was heard,
+         * arm the microphone for the
+         * next command.
+         */
         this.zone.run(() => {
           this.armed.set(true);
           this.status.set(
             'Listening…',
           );
         });
-
-        /*
-         * If command was:
-         *
-         * "Hey Toto, open Chrome"
-         *
-         * then submit the command
-         * immediately.
-         */
-        if (rest) {
-          this.submitCommand(
-            rest,
-          );
-        }
       },
     );
   }
 
   /**
    * Submit command to AppComponent.
+   *
+   * IMPORTANT:
+   *
+   * There is no confirmation state.
+   *
+   * Whatever command arrives here is
+   * immediately passed to AppComponent.
    */
   private submitCommand(
     text: string,
@@ -881,10 +758,6 @@ export class VoiceService {
       command,
     );
 
-    /*
-     * Clear all temporary voice modes.
-     */
-    this.confirmationMode = false;
     this.armed.set(false);
     this.transcript.set('');
     this.wakeBuffer = '';

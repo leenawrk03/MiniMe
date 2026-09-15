@@ -143,10 +143,13 @@ function createWindow() {
    ===================================================== */
 
 ipcMain.on('minime:resize', (_event, expanded) => {
+  console.log('🔥 RESIZE MESSAGE RECEIVED:', expanded);
 
   if (!win) return;
 
   const size = expanded ? EXPANDED : COLLAPSED;
+
+  // console.log(`📐 MiniMe resize: ${size.width}x${size.height}`);
 
   win.setSize(size.width, size.height);
 
@@ -159,6 +162,7 @@ ipcMain.on('minime:resize', (_event, expanded) => {
 
   win.setAlwaysOnTop(true, 'floating');
 
+  console.log('📐 Actual Electron bounds:', win.getBounds());
 });
 
 

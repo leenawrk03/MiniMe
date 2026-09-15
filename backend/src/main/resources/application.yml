@@ -48,6 +48,16 @@ minime:
     llm-extraction: false
     min-similarity: 0.55
     duplicate-similarity: 0.93
+  # MCP client/server wiring.
+  mcp:
+    github:
+      # Off by default. Flip to true (or set GITHUB_MCP_ENABLED=true) once
+      # the github-mcp docker-compose service is up and reachable.
+      enabled: ${GITHUB_MCP_ENABLED:false}
+      endpoint: ${GITHUB_MCP_ENDPOINT:http://localhost:8086/mcp}
+      # Only needed if the container isn't already started with
+      # GITHUB_PERSONAL_ACCESS_TOKEN (see docker-compose.yml).
+      token: ${GITHUB_PERSONAL_ACCESS_TOKEN:}
   # One single long conversation, all data local.
   conversation-id: primary
   system-prompt: |

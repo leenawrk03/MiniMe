@@ -1,0 +1,19 @@
+services:
+  github-mcp:
+    image: ghcr.io/github/github-mcp-server:latest
+    container_name: minime-github-mcp
+    restart: unless-stopped
+    # Streamable HTTP mode, exposed at /mcp so it matches
+    # minime.mcp.github.endpoint in application.yml (http://localhost:8086/mcp).
+    # --read-only is the safe default: MiniMe can look things up (issues, PRs,
+    # code, etc.) but can't create/merge/push/delete anything on GitHub.
+    # Drop --read-only once you're comfortable letting Gemini take write
+    # actions through chat with no confirmation step.
+    command: ["http", "--base-path", "/mcp", "--read-only"]
+    environment:
+      # A GitHub Personal Access Token (classic or fine-grained) with the
+      # scopes you want to expose. Put it in a local .env file - see
+      # .env.example - never commit the real token.
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN}
+    ports:
+      - "8086:8082"
