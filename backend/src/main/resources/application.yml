@@ -39,6 +39,12 @@ minime:
     retry-backoff-ms: 400
     timeout-seconds: 20
     max-output-tokens: 512
+  jev:
+    enabled: ${JEV_ENABLED:true}
+    api-key: ${TYPESAFE_API_KEY}
+    base-url: ${JEV_BASE_URL:https://api.typesafe.ai}
+    model: ${JEV_MODEL:jev-latest}
+    timeout-seconds: 5
   # Phase 2: persistent memory (pgvector).
   memory:
     embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}

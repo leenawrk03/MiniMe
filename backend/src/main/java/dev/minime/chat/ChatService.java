@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import dev.minime.config.LlmConfig.GeminiModel;
 import dev.minime.config.LlmConfig.GeminiModelChain;
 import dev.minime.config.MiniMeProperties;
+import dev.minime.jev.JevDecisionService;
 import dev.minime.memory.MemoryService;
 import dev.minime.mcp.McpClientService;
 import dev.minime.mcp.GitHubMcpClientService;
@@ -62,6 +63,7 @@ public class ChatService {
     private final McpClientService mcpClient;
     private final GitHubMcpClientService githubMcp;
     private final ObjectMapper objectMapper;
+    private final JevDecisionService jev;
 
     public ChatService(
             ChatMessageRepository repository,
@@ -75,7 +77,9 @@ public class ChatService {
             @Nullable GeminiModelChain modelChain,
             McpClientService mcpClient,
             GitHubMcpClientService githubMcp,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            @Autowired(required = false)
+            @Nullable JevDecisionService jev) {
 
         this.repository = repository;
         this.props = props;
@@ -89,6 +93,7 @@ public class ChatService {
         this.mcpClient = mcpClient;
         this.githubMcp = githubMcp;
         this.objectMapper = objectMapper;
+        this.jev = jev;
     }
 
     @Transactional(readOnly = true)
@@ -152,10 +157,18 @@ public class ChatService {
                             reminderBlock
                     );
 
+            /*
+             * Jev (TypeSafe System One) pre-classifies the message. Plain
+             * chat skips the MCP tool block entirely, which saves tokens and
+             * latency. When Jev is off or unsure, tools stay available.
+             */
+            boolean toolsAllowed =
+                    jev == null || jev.allowsTools(userText);
+
             try {
 
                 answer =
-                        generateWithFallback(prompt);
+                        generateWithFallback(prompt, toolsAllowed);
 
             } catch (Exception e) {
 
@@ -207,7 +220,8 @@ public class ChatService {
      * the tool is executed immediately.
      */
     private String generateWithFallback(
-            List<ChatMessage> prompt) {
+            List<ChatMessage> prompt,
+            boolean toolsAllowed) {
 
         List<GeminiModel> chain =
                 modelChain.isEmpty()
@@ -250,7 +264,8 @@ public class ChatService {
 
                     return chatWithMcpTools(
                             candidate.model(),
-                            prompt
+                            prompt,
+                            toolsAllowed
                     );
 
                 } catch (RuntimeException error) {
@@ -329,7 +344,22 @@ public class ChatService {
      */
     private String chatWithMcpTools(
             ChatLanguageModel chatModel,
-            List<ChatMessage> messages) {
+            List<ChatMessage> messages,
+            boolean toolsAllowed) {
+
+        /*
+         * Jev decided this is plain conversation: no tool specifications,
+         * one straight Gemini call. This is the common case and the cheapest.
+         */
+        if (!toolsAllowed) {
+
+            ChatRequest plainRequest =
+                    ChatRequest.builder()
+                            .messages(messages)
+                            .build();
+
+            return chatModel.chat(plainRequest).aiMessage().text();
+        }
 
         ToolSpecification openApplicationTool =
                 ToolSpecification.builder()
@@ -453,13 +483,13 @@ public class ChatService {
             McpSchema.CallToolResult toolResult =
                     isGithubTool
                             ? githubMcp.callTool(
-                                    toolRequest.name(),
-                                    arguments
-                            )
+                            toolRequest.name(),
+                            arguments
+                    )
                             : mcpClient.callTool(
-                                    toolRequest.name(),
-                                    arguments
-                            );
+                            toolRequest.name(),
+                            arguments
+                    );
 
             String resultText =
                     extractToolResultText(toolResult);
@@ -864,7 +894,7 @@ public class ChatService {
         system.append(
                 "\nUse remembered facts naturally; "
                         + "never claim to remember something not listed."+
-                "\nGitHub instructions: "
+                        "\nGitHub instructions: "
                         + "You have access to the user's authenticated GitHub account through the GitHub MCP server. "
                         + "Treat GitHub as account-wide, not limited to a specific repository. "
                         + "The user's GitHub username is leenawrk03. "
